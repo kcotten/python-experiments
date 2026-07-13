@@ -1,0 +1,10 @@
+2024-01-15 10:23:01 ERROR disk full
+2024-01-15 10:23:01 WARNING disk getting full
+2024-01-15 10:23:01 INFO some info from the application
+2024-01-15 10:23:01 ERROR too many connections
+2024-01-15 10:23:01 INFO disk ok
+2024-01-15 10:23:01 INFO other info from the application
+2024-01-15 10:23:01 INFO time to purge the disk
+2024-01-15 10:23:01 INFO stopped purge
+2024-01-15 10:23:01 ERROR disk full
+2024-01-15 10:23:01 INFO some info from the application

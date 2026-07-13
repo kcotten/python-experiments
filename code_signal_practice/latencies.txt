@@ -1,0 +1,12 @@
+GET /api/users 142ms
+POST /api/record 263ms
+HEAD /api/users 18ms
+GET /api/users 400ms
+GET /api/users 142ms
+POST /api/record 465ms
+HEAD /api/users 18ms
+GET /api/users 500ms
+GET /api/users 142ms
+POST /api/record 763ms
+HEAD /api/users 18ms
+GET /api/users 370ms
