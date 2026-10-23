@@ -1,7 +1,7 @@
 [project]
-name = "problems"
+name = "python-experiments"
 version = "0.1.0"
-description = "Add your description here"
+description = "A collection of Python experiments and utilities"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -36,7 +36,7 @@ line-ending = "auto"
 docstring-code-format = false
 docstring-code-line-length = "dynamic"
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["app"]
 
 [tool.ruff.lint.pydocstyle]

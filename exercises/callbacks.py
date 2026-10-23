@@ -1,8 +1,7 @@
 from threading import Thread
 
+
 # basic callback pattern
-
-
 def process_data(data, callback):
     result = data + 2
     callback(result)
