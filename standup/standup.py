@@ -7,6 +7,7 @@ Pulls data from GitHub, Jira, and personal notes to create Slack standup posts
 import argparse
 import json
 import os
+import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Optional
@@ -49,6 +50,10 @@ class StandupGenerator:
                 "project_keys": ["PROJ", "TEAM"],
                 "include_completed": True,
                 "include_in_progress": True,
+            },
+            "confluence": {
+                "base_url": "https://your-org.atlassian.net",
+                "username": "your-email@company.com",
             },
             "notes": {"file_path": "./daily_notes.md", "format": "markdown"},
             "slack": {
@@ -321,9 +326,9 @@ class StandupGenerator:
 
     @staticmethod
     def _is_date_header(line: str) -> bool:
-        """True for '##' lines that look like they carry a 2024/2025 date"""
-        return line.startswith("##") and any(
-            year in line for year in ("2025-", "2024-")
+        """True for '##' lines that carry a YYYY-MM-DD date"""
+        return line.startswith("##") and bool(
+            re.search(r"\d{4}-\d{2}-\d{2}", line)
         )
 
     @staticmethod
