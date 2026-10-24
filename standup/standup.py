@@ -6,6 +6,7 @@ Pulls data from GitHub, Jira, and personal notes to create Slack standup posts
 
 import argparse
 import json
+import logging
 import os
 import re
 from collections.abc import Callable
@@ -13,6 +14,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
+
+log = logging.getLogger("standup")
 
 
 class StandupGenerator:
@@ -72,8 +75,9 @@ class StandupGenerator:
         with open(config_file, "w") as f:
             json.dump(default_config, f, indent=2)
 
-        print(
-            f"Created default config at {config_file}. Please update with your details."
+        log.warning(
+            "Created default config at %s. Please update with your details.",
+            config_file,
         )
         return default_config
 
@@ -96,13 +100,22 @@ class StandupGenerator:
 
         return last_workday.strftime("%Y-%m-%d")
 
+    @staticmethod
+    def _report_failure(what: str, response: requests.Response) -> None:
+        """Log the status and start of the body for a failed API call"""
+        log.error(
+            "Error fetching %s: HTTP %s %s",
+            what,
+            response.status_code,
+            response.text[:200],
+        )
+
     def get_github_activity(self) -> dict:
         """Fetch GitHub activity since last workday"""
         if not self.github_token:
             return {"error": "GitHub token not found"}
 
         last_workday = self.get_last_workday()
-        today = datetime.now().strftime("%Y-%m-%d")
         headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
@@ -120,7 +133,7 @@ class StandupGenerator:
         for repo in repos:
             activity["commits"].extend(
                 self._fetch_github_commits(
-                    repo, headers, username, last_workday, today
+                    repo, headers, username, last_workday
                 )
             )
 
@@ -137,30 +150,58 @@ class StandupGenerator:
 
         return activity
 
+    def _fetch_github_branches(self, repo: str, headers: dict) -> list[str]:
+        """List branch names for one repo (the commits API defaults to the
+        default branch only)"""
+        url = f"https://api.github.com/repos/{repo}/branches"
+
+        try:
+            response = requests.get(
+                url, headers=headers, params={"per_page": 100}
+            )
+            if response.status_code == 200:
+                return [branch["name"] for branch in response.json()]
+            self._report_failure(f"branches for {repo}", response)
+        except Exception:
+            log.exception("Error fetching branches for %s", repo)
+
+        return []
+
     def _fetch_github_commits(
         self,
         repo: str,
         headers: dict,
         username: str,
         last_workday: str,
-        today: str,
     ) -> list[dict]:
-        """Fetch the user's commits for one repo in the date window"""
+        """Fetch the user's commits across all branches of one repo since
+        last workday, de-duplicated by SHA"""
         commits: list[dict] = []
+        seen: set[str] = set()
         url = f"https://api.github.com/repos/{repo}/commits"
-        params = {
-            "author": username,
-            "since": f"{last_workday}T00:00:00Z",
-            "until": f"{today}T00:00:00Z",
-        }
 
-        try:
-            response = requests.get(url, headers=headers, params=params)
-            if response.status_code == 200:
+        for branch in self._fetch_github_branches(repo, headers):
+            params = {
+                "author": username,
+                "since": f"{last_workday}T00:00:00Z",
+                "sha": branch,
+            }
+
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                if response.status_code != 200:
+                    self._report_failure(
+                        f"commits for {repo}@{branch}", response
+                    )
+                    continue
                 for commit in response.json():
+                    if commit["sha"] in seen:
+                        continue
+                    seen.add(commit["sha"])
                     commits.append(
                         {
                             "repo": repo,
+                            "branch": branch,
                             "message": commit["commit"]["message"].split("\n")[
                                 0
                             ],
@@ -168,8 +209,8 @@ class StandupGenerator:
                             "url": commit["html_url"],
                         }
                     )
-        except Exception as e:
-            print(f"Error fetching commits for {repo}: {e}")
+            except Exception:
+                log.exception("Error fetching commits for %s@%s", repo, branch)
 
         return commits
 
@@ -207,8 +248,10 @@ class StandupGenerator:
                         )
                     if pr["merged_at"] and pr["merged_at"] >= since:
                         merged.append({**summary, "merged_at": pr["merged_at"]})
-        except Exception as e:
-            print(f"Error fetching PRs for {repo}: {e}")
+            else:
+                self._report_failure(f"PRs for {repo}", response)
+        except Exception:
+            log.exception("Error fetching PRs for %s", repo)
 
         return opened, merged
 
@@ -240,8 +283,10 @@ class StandupGenerator:
                             "number": pr["number"],
                         }
                     )
-        except Exception as e:
-            print(f"Error fetching PR reviews: {e}")
+            else:
+                self._report_failure("PR reviews", response)
+        except Exception:
+            log.exception("Error fetching PR reviews")
 
         return reviews
 
@@ -272,7 +317,7 @@ class StandupGenerator:
         # JQL query for tickets updated since last workday
         jql = f'assignee = currentUser() AND updated >= "{last_workday}" ORDER BY updated DESC'
 
-        url = f"{base_url}/rest/api/3/search"
+        url = f"{base_url}/rest/api/3/search/jql"
         params = {
             "jql": jql,
             "fields": "key,summary,status,updated",
@@ -302,8 +347,10 @@ class StandupGenerator:
                         activity["in_progress"].append(ticket)
                     else:
                         activity["updated"].append(ticket)
-        except Exception as e:
-            print(f"Error fetching Jira tickets: {e}")
+            else:
+                self._report_failure("Jira tickets", response)
+        except Exception:
+            log.exception("Error fetching Jira tickets")
 
         return activity
 
@@ -317,8 +364,8 @@ class StandupGenerator:
         try:
             with open(notes_file, "r") as f:
                 content = f.read()
-        except Exception as e:
-            print(f"Error reading notes file: {e}")
+        except Exception:
+            log.exception("Error reading notes file")
             return {"completed": [], "plan": []}
 
         last_workday = datetime.strptime(self.get_last_workday(), "%Y-%m-%d")
@@ -423,9 +470,9 @@ class StandupGenerator:
         }
 
         last_workday = self.get_last_workday()
-        print(f"[DEBUG] Confluence: Looking for activity since {last_workday}")
-        print(f"[DEBUG] Confluence: Base URL: {base_url}")
-        print(f"[DEBUG] Confluence: Username: {username}")
+        log.debug("Confluence: looking for activity since %s", last_workday)
+        log.debug("Confluence: base URL: %s", base_url)
+        log.debug("Confluence: username: %s", username)
 
         activity = {"created": [], "updated": []}
 
@@ -441,24 +488,26 @@ class StandupGenerator:
                 "limit": 10,
             }
 
-            print(f"[DEBUG] Testing broad CQL: {cql_test}")
+            log.debug("Testing broad CQL: %s", cql_test)
             response = requests.get(url, headers=headers, params=params_test)
-            print(f"[DEBUG] Test response status: {response.status_code}")
+            log.debug("Test response status: %s", response.status_code)
 
             if response.status_code == 200:
-                test_results = response.json()
-                print(
-                    f"[DEBUG] Total pages found (no date filter): {len(test_results.get('results', []))}"
+                test_results = response.json().get("results", [])
+                log.debug(
+                    "Total pages found (no date filter): %d", len(test_results)
                 )
-                for page in test_results.get("results", [])[:3]:
+                for page in test_results[:3]:
                     created_date = page.get("history", {}).get(
                         "createdDate", "Unknown"
                     )
-                    print(
-                        f"[DEBUG] Sample page: '{page['title']}' created: {created_date}"
+                    log.debug(
+                        "Sample page: '%s' created: %s",
+                        page["title"],
+                        created_date,
                     )
             else:
-                print(f"[DEBUG] Test query failed: {response.text}")
+                self._report_failure("Confluence test query", response)
                 return {"error": f"Test query failed: {response.status_code}"}
 
             # Now try with date filter
@@ -469,20 +518,22 @@ class StandupGenerator:
                 "limit": 50,
             }
 
-            print(f"[DEBUG] CQL with date filter: {cql_created}")
+            log.debug("CQL with date filter: %s", cql_created)
             response = requests.get(url, headers=headers, params=params)
-            print(
-                f"[DEBUG] Date-filtered response status: {response.status_code}"
+            log.debug(
+                "Date-filtered response status: %s", response.status_code
             )
 
             if response.status_code == 200:
                 results = response.json().get("results", [])
-                print(
-                    f"[DEBUG] Pages created since {last_workday}: {len(results)}"
+                log.debug(
+                    "Pages created since %s: %d", last_workday, len(results)
                 )
                 for page in results:
-                    print(
-                        f"[DEBUG] Found created page: '{page['title']}' in space: {page['space']['name']}"
+                    log.debug(
+                        "Found created page: '%s' in space: %s",
+                        page["title"],
+                        page["space"]["name"],
                     )
                     activity["created"].append(
                         {
@@ -494,7 +545,7 @@ class StandupGenerator:
                         }
                     )
             else:
-                print(f"[DEBUG] Created pages query failed: {response.text}")
+                self._report_failure("Confluence created pages", response)
 
             # Search for pages updated by current user since last workday
             cql_updated = f'contributor = currentUser() AND lastModified >= "{last_workday}" AND type = "page"'
@@ -504,20 +555,22 @@ class StandupGenerator:
                 "limit": 50,
             }
 
-            print(f"[DEBUG] CQL for updates: {cql_updated}")
+            log.debug("CQL for updates: %s", cql_updated)
             response = requests.get(url, headers=headers, params=params)
-            print(
-                f"[DEBUG] Updated pages response status: {response.status_code}"
+            log.debug(
+                "Updated pages response status: %s", response.status_code
             )
 
             if response.status_code == 200:
                 results = response.json().get("results", [])
-                print(
-                    f"[DEBUG] Pages updated since {last_workday}: {len(results)}"
+                log.debug(
+                    "Pages updated since %s: %d", last_workday, len(results)
                 )
                 for page in results:
-                    print(
-                        f"[DEBUG] Found updated page: '{page['title']}' in space: {page['space']['name']}"
+                    log.debug(
+                        "Found updated page: '%s' in space: %s",
+                        page["title"],
+                        page["space"]["name"],
                     )
                     activity["updated"].append(
                         {
@@ -529,14 +582,16 @@ class StandupGenerator:
                         }
                     )
             else:
-                print(f"[DEBUG] Updated pages query failed: {response.text}")
+                self._report_failure("Confluence updated pages", response)
 
         except Exception as e:
-            print(f"[DEBUG] Exception in Confluence activity: {e}")
+            log.exception("Exception in Confluence activity")
             return {"error": str(e)}
 
-        print(
-            f"[DEBUG] Final activity: {len(activity['created'])} created, {len(activity['updated'])} updated"
+        log.debug(
+            "Final activity: %d created, %d updated",
+            len(activity["created"]),
+            len(activity["updated"]),
         )
         return activity
 
@@ -846,11 +901,11 @@ class StandupGenerator:
                 result = response.json()
                 return result["choices"][0]["message"]["content"].strip()
             else:
-                print(f"OpenAI API error: {response.status_code}")
+                self._report_failure("OpenAI summary", response)
                 return self._generate_simple_summary(data)
 
-        except Exception as e:
-            print(f"Error generating OpenAI summary: {e}")
+        except Exception:
+            log.exception("Error generating OpenAI summary")
             return self._generate_simple_summary(data)
 
     def _generate_anthropic_summary(self, data: dict) -> str:
@@ -887,11 +942,11 @@ class StandupGenerator:
                 result = response.json()
                 return result["content"][0]["text"].strip()
             else:
-                print(f"Anthropic API error: {response.status_code}")
+                self._report_failure("Anthropic summary", response)
                 return self._generate_simple_summary(data)
 
-        except Exception as e:
-            print(f"Error generating Anthropic summary: {e}")
+        except Exception:
+            log.exception("Error generating Anthropic summary")
             return self._generate_simple_summary(data)
 
     # Per-style (intro, instruction) wrapped around the activity summary
@@ -983,7 +1038,7 @@ class StandupGenerator:
     ) -> bool:
         """Post message to Slack via webhook using Block Kit or fallback text"""
         if not self.slack_webhook:
-            print("Slack webhook URL not configured")
+            log.error("Slack webhook URL not configured")
             return False
 
         # Prefer blocks format over text
@@ -1003,57 +1058,66 @@ class StandupGenerator:
                 "text": message,
             }
         else:
-            print("No content to post to Slack")
+            log.error("No content to post to Slack")
             return False
 
         try:
             response = requests.post(self.slack_webhook, json=payload)
+            if response.status_code != 200:
+                self._report_failure("Slack post", response)
             return response.status_code == 200
-        except Exception as e:
-            print(f"Error posting to Slack: {e}")
+        except Exception:
+            log.exception("Error posting to Slack")
             return False
 
-    def _collect_github(self, debug: bool) -> dict:
-        print("Fetching GitHub activity...")
+    @staticmethod
+    def _warn_if_error(source: str, data: dict) -> None:
+        """Warn when a source returned an error dict instead of data"""
+        if "error" in data:
+            log.warning("%s unavailable: %s", source, data["error"])
+
+    def _collect_github(self) -> dict:
+        log.info("Fetching GitHub activity...")
         github_data = self.get_github_activity()
-        if debug:
-            print(
-                f"GitHub data: {len(github_data.get('commits', []))} commits, {len(github_data.get('prs_merged', []))} merged PRs"
-            )
+        self._warn_if_error("GitHub", github_data)
+        log.debug(
+            "GitHub data: %d commits, %d merged PRs",
+            len(github_data.get("commits", [])),
+            len(github_data.get("prs_merged", [])),
+        )
         return github_data
 
-    def _collect_jira(self, debug: bool) -> dict:
-        print("Fetching Jira activity...")
+    def _collect_jira(self) -> dict:
+        log.info("Fetching Jira activity...")
         jira_data = self.get_jira_activity()
-        if debug:
-            if "error" in jira_data:
-                print(f"Jira error: {jira_data['error']}")
-            else:
-                print(
-                    f"Jira data: {len(jira_data.get('completed', []))} completed, {len(jira_data.get('updated', []))} updated, {len(jira_data.get('in_progress', []))} in progress"
-                )
+        self._warn_if_error("Jira", jira_data)
+        log.debug(
+            "Jira data: %d completed, %d updated, %d in progress",
+            len(jira_data.get("completed", [])),
+            len(jira_data.get("updated", [])),
+            len(jira_data.get("in_progress", [])),
+        )
         return jira_data
 
-    def _collect_notes(self, debug: bool) -> dict[str, list[str]]:
-        print("Reading personal notes...")
+    def _collect_notes(self) -> dict[str, list[str]]:
+        log.info("Reading personal notes...")
         notes = self.get_personal_notes()
-        if debug:
-            print(
-                f"Personal notes: {len(notes.get('completed', []))} completed items, {len(notes.get('plan', []))} plan items"
-            )
+        log.debug(
+            "Personal notes: %d completed items, %d plan items",
+            len(notes.get("completed", [])),
+            len(notes.get("plan", [])),
+        )
         return notes
 
-    def _collect_confluence(self, debug: bool) -> dict:
-        print("Fetching Confluence activity...")
+    def _collect_confluence(self) -> dict:
+        log.info("Fetching Confluence activity...")
         confluence_data = self.get_confluence_activity()
-        if debug:
-            if "error" in confluence_data:
-                print(f"Confluence error: {confluence_data['error']}")
-            else:
-                print(
-                    f"Confluence data: {len(confluence_data.get('created', []))} created, "
-                    f"{len(confluence_data.get('updated', []))} updated"
-                )
+        self._warn_if_error("Confluence", confluence_data)
+        log.debug(
+            "Confluence data: %d created, %d updated",
+            len(confluence_data.get("created", [])),
+            len(confluence_data.get("updated", [])),
+        )
         return confluence_data
 
     def _collect_ai_summary(
@@ -1062,61 +1126,56 @@ class StandupGenerator:
         jira_data: dict,
         confluence_data: dict,
         notes: dict[str, list[str]],
-        debug: bool,
     ) -> Optional[str]:
         if not self.config.get("ai_summary", {}).get("enabled", False):
-            if debug:
-                print("AI summary disabled in config")
+            log.debug("AI summary disabled in config")
             return None
 
-        print("Generating AI summary...")
+        log.info("Generating AI summary...")
         ai_summary = self.generate_ai_summary(
             github_data,
             jira_data,
             confluence_data,
             notes.get("completed", []),
         )
-        if debug:
-            print(
-                f"AI summary generated: {ai_summary[:100] if ai_summary else 'None'}..."
-            )
+        log.debug(
+            "AI summary generated: %s...",
+            ai_summary[:100] if ai_summary else "None",
+        )
         return ai_summary
 
     def _post_standup(self, blocks: list[dict], message: str) -> None:
         """Post to Slack, trying rich blocks first and falling back to text"""
-        print("Posting to Slack...")
+        log.info("Posting to Slack...")
         if self.post_to_slack(blocks=blocks):
-            print("✅ Successfully posted to Slack with rich formatting!")
+            log.info("✅ Successfully posted to Slack with rich formatting!")
         elif self.post_to_slack(message=message):
-            print("✅ Posted to Slack with basic formatting (blocks failed)")
+            log.info("✅ Posted to Slack with basic formatting (blocks failed)")
         else:
-            print("❌ Failed to post to Slack")
+            log.error("❌ Failed to post to Slack")
 
     def generate_standup(
         self,
         dry_run: bool = False,
         post_to_slack: bool = False,
-        debug: bool = False,
     ) -> str:
         """Generate the complete standup message"""
         if dry_run:
-            print("🧪 DRY RUN MODE - No data will be posted to Slack")
-            print("=" * 50)
+            log.info("🧪 DRY RUN MODE - No data will be posted to Slack")
 
-        github_data = self._collect_github(debug)
-        jira_data = self._collect_jira(debug)
-        notes = self._collect_notes(debug)
-        confluence_data = self._collect_confluence(debug)
+        github_data = self._collect_github()
+        jira_data = self._collect_jira()
+        notes = self._collect_notes()
+        confluence_data = self._collect_confluence()
         ai_summary = self._collect_ai_summary(
-            github_data, jira_data, confluence_data, notes, debug
+            github_data, jira_data, confluence_data, notes
         )
 
-        print("Formatting standup message...")
+        log.info("Formatting standup message...")
         blocks = self.format_standup_blocks(
             github_data, jira_data, confluence_data, notes, ai_summary
         )
-        if debug:
-            print("Slack blocks:", blocks)
+        log.debug("Slack blocks: %s", blocks)
         message = self.format_standup_message(
             github_data, jira_data, confluence_data, notes, ai_summary
         )
@@ -1124,7 +1183,7 @@ class StandupGenerator:
         if post_to_slack and not dry_run:
             self._post_standup(blocks, message)
         elif post_to_slack and dry_run:
-            print("🚫 Skipping Slack post due to dry run mode")
+            log.info("🚫 Skipping Slack post due to dry run mode")
 
         return message
 
@@ -1152,6 +1211,11 @@ def main():
 
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+
     # Dry run mode takes precedence over post
     if args.dry_run:
         post_to_slack = False
@@ -1162,7 +1226,7 @@ def main():
 
     generator = StandupGenerator(args.config)
     message = generator.generate_standup(
-        dry_run=dry_run, post_to_slack=post_to_slack, debug=args.debug
+        dry_run=dry_run, post_to_slack=post_to_slack
     )
 
     print("\n" + "=" * 50)
